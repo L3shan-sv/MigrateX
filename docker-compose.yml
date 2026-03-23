@@ -1,0 +1,281 @@
+version: "3.9"
+
+# ── MigrateX — Full Stack Docker Compose ────────────────────────────────────
+#
+# Spins up:
+#   - Source MySQL (edge simulation)
+#   - Target MySQL (cloud simulation)
+#   - Zookeeper + Kafka (CDC backbone)
+#   - Kafka Connect + Debezium (CDC connector)
+#   - Schema Registry (schema evolution)
+#   - etcd cluster (distributed lease fencing, 3 nodes)
+#   - Prometheus + Grafana (observability)
+#   - MigrateX Phase 1 (discovery service)
+#
+# Usage:
+#   docker compose up -d              # start everything
+#   docker compose up source target   # start DBs only (for Phase 1 dev)
+#   docker compose logs -f phase1     # tail Phase 1 logs
+#   docker compose down -v            # stop and remove volumes
+
+networks:
+  migratex:
+    driver: bridge
+
+volumes:
+  source_data:
+  target_data:
+  kafka_data:
+  zookeeper_data:
+  etcd0_data:
+  etcd1_data:
+  etcd2_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ── Source database (edge simulation) ──────────────────────────────────────
+  source:
+    image: mysql:8.0
+    container_name: migratex-source
+    networks: [migratex]
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: airbnb_prod
+      MYSQL_USER: migratex_reader
+      MYSQL_PASSWORD: migratex_reader_pass
+    volumes:
+      - source_data:/var/lib/mysql
+      - ./docker/mysql/source.cnf:/etc/mysql/conf.d/migratex.cnf:ro
+      - ./docker/mysql/init-source.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --expire-logs-days=7
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+      --read-only=OFF
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Target database (cloud simulation) ─────────────────────────────────────
+  target:
+    image: mysql:8.0
+    container_name: migratex-target
+    networks: [migratex]
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: airbnb_prod
+      MYSQL_USER: migratex_writer
+      MYSQL_PASSWORD: migratex_writer_pass
+    volumes:
+      - target_data:/var/lib/mysql
+      - ./docker/mysql/target.cnf:/etc/mysql/conf.d/migratex.cnf:ro
+    command: >
+      --server-id=2
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+      --read-only=OFF
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Zookeeper (Kafka dependency) ────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: migratex-zookeeper
+    networks: [migratex]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+
+  # ── Kafka (CDC event log) ───────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: migratex-kafka
+    networks: [migratex]
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168    # 7 days — matches binlog retention
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  # ── Schema Registry ─────────────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: migratex-schema-registry
+    networks: [migratex]
+    ports:
+      - "8081:8081"
+    depends_on:
+      - kafka
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+
+  # ── Kafka Connect + Debezium (CDC connector) ────────────────────────────────
+  kafka-connect:
+    image: debezium/connect:2.6
+    container_name: migratex-kafka-connect
+    networks: [migratex]
+    ports:
+      - "8083:8083"
+    depends_on:
+      - kafka
+      - source
+      - schema-registry
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: migratex-connect-group
+      CONFIG_STORAGE_TOPIC: migratex-connect-configs
+      OFFSET_STORAGE_TOPIC: migratex-connect-offsets
+      STATUS_STORAGE_TOPIC: migratex-connect-status
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+
+  # ── etcd node 0 (AZ-1 simulation) ──────────────────────────────────────────
+  etcd0:
+    image: bitnami/etcd:3.5
+    container_name: migratex-etcd0
+    networks: [migratex]
+    ports:
+      - "2379:2379"
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd0
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd0:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd0:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: migratex-cluster
+    volumes:
+      - etcd0_data:/bitnami/etcd
+
+  etcd1:
+    image: bitnami/etcd:3.5
+    container_name: migratex-etcd1
+    networks: [migratex]
+    ports:
+      - "2381:2379"
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: migratex-cluster
+    volumes:
+      - etcd1_data:/bitnami/etcd
+
+  etcd2:
+    image: bitnami/etcd:3.5
+    container_name: migratex-etcd2
+    networks: [migratex]
+    ports:
+      - "2383:2379"
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: migratex-cluster
+    volumes:
+      - etcd2_data:/bitnami/etcd
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: migratex-prometheus
+    networks: [migratex]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: migratex-grafana
+    networks: [migratex]
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: migratex
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+
+  # ── MigrateX Phase 1 ────────────────────────────────────────────────────────
+  phase1:
+    build:
+      context: ./phase1-discovery
+      dockerfile: Dockerfile
+    container_name: migratex-phase1
+    networks: [migratex]
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    environment:
+      SOURCE_HOST: source
+      SOURCE_PORT: 3306
+      SOURCE_USER: migratex_reader
+      SOURCE_PASSWORD: migratex_reader_pass
+      SOURCE_DATABASE: airbnb_prod
+      TARGET_HOST: target
+      TARGET_PORT: 3306
+      TARGET_USER: migratex_writer
+      TARGET_PASSWORD: migratex_writer_pass
+      TARGET_DATABASE: airbnb_prod
+      PONR_SIMULATIONS: 10000
+      PONR_SLA_THRESHOLD_USD: 5000.0
+      ANOMALY_ALERT_THRESHOLD: 0.7
+      OUTPUT_DIR: /app/artifacts
+      LOG_LEVEL: INFO
+    volumes:
+      - ./artifacts/phase1:/app/artifacts
+    command: python main.py run --ponr-data-gb 100 --ponr-write-mbps 50 --ponr-network-gbps 1.0
