@@ -2,21 +2,32 @@ version: "3.9"
 
 # ── MigrateX — Full Stack Docker Compose ────────────────────────────────────
 #
-# Spins up:
-#   - Source MySQL (edge simulation)
-#   - Target MySQL (cloud simulation)
-#   - Zookeeper + Kafka (CDC backbone)
-#   - Kafka Connect + Debezium (CDC connector)
-#   - Schema Registry (schema evolution)
-#   - etcd cluster (distributed lease fencing, 3 nodes)
-#   - Prometheus + Grafana (observability)
-#   - MigrateX Phase 1 (discovery service)
+# Services:
+#   source          MySQL 8.0 (edge — authoritative write target)
+#   target          MySQL 8.0 (cloud — migration destination)
+#   zookeeper       Kafka dependency
+#   kafka           CDC event log (1 broker in dev, 3 in prod)
+#   schema-registry Avro schema evolution
+#   kafka-connect   Debezium MySQL connector host
+#   etcd0/1/2       Distributed lease fencing (3-node Raft cluster)
+#   prometheus      Metrics collection
+#   grafana         Dashboards (localhost:3000 admin/migratex)
+#   phase1          Discovery & Risk Profiling
+#   phase2          Infrastructure Provisioning
+#   phase3          Chaos Validation
+#   phase4          Dark Launch & Semantic Audit
+#   phase5          Event Horizon & Cutover
+#   phase6          Post-Migration Hardening
 #
-# Usage:
-#   docker compose up -d              # start everything
-#   docker compose up source target   # start DBs only (for Phase 1 dev)
-#   docker compose logs -f phase1     # tail Phase 1 logs
-#   docker compose down -v            # stop and remove volumes
+# Quick start:
+#   docker compose up -d source target             # DBs only
+#   docker compose up -d                           # full stack
+#   docker compose up -d source target kafka etcd0 etcd1 etcd2  # phase 2 deps
+#
+# Credentials:
+#   MySQL root: rootpassword
+#   MySQL app:  see SOURCE_*/TARGET_* env vars
+#   Grafana:    admin / migratex
 
 networks:
   migratex:
@@ -32,10 +43,44 @@ volumes:
   etcd2_data:
   prometheus_data:
   grafana_data:
+  phase1_artifacts:
+  phase2_artifacts:
+  phase3_artifacts:
+  phase4_artifacts:
+  phase5_artifacts:
+  phase6_artifacts:
+
+# ── Shared environment ────────────────────────────────────────────────────────
+x-source-env: &source-env
+  SOURCE_HOST: source
+  SOURCE_PORT: "3306"
+  SOURCE_USER: migratex_reader
+  SOURCE_PASSWORD: migratex_reader_pass
+  SOURCE_DATABASE: airbnb_prod
+
+x-target-env: &target-env
+  TARGET_HOST: target
+  TARGET_PORT: "3306"
+  TARGET_USER: migratex_writer
+  TARGET_PASSWORD: migratex_writer_pass
+  TARGET_DATABASE: airbnb_prod
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  KAFKA_TOPIC_PREFIX: migratex
+
+x-etcd-env: &etcd-env
+  ETCD_ENDPOINTS: etcd0:2379,etcd1:2379,etcd2:2379
+  ETCD_LEASE_TTL_SECONDS: "10"
+
+x-ponr-env: &ponr-env
+  PONR_SIMULATIONS: "10000"
+  PONR_SLA_THRESHOLD_USD: "5000.0"
+  ANOMALY_ALERT_THRESHOLD: "0.7"
 
 services:
 
-  # ── Source database (edge simulation) ──────────────────────────────────────
+  # ── Source MySQL (edge — on-premise simulation) ───────────────────────────
   source:
     image: mysql:8.0
     container_name: migratex-source
@@ -59,14 +104,16 @@ services:
       --expire-logs-days=7
       --gtid-mode=ON
       --enforce-gtid-consistency=ON
+      --performance-schema=ON
       --read-only=OFF
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
-  # ── Target database (cloud simulation) ─────────────────────────────────────
+  # ── Target MySQL (cloud simulation) ──────────────────────────────────────
   target:
     image: mysql:8.0
     container_name: migratex-target
@@ -85,14 +132,16 @@ services:
       --server-id=2
       --gtid-mode=ON
       --enforce-gtid-consistency=ON
+      --performance-schema=ON
       --read-only=OFF
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
-  # ── Zookeeper (Kafka dependency) ────────────────────────────────────────────
+  # ── Zookeeper ─────────────────────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: migratex-zookeeper
@@ -100,10 +149,16 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_LOG4J_ROOT_LOGLEVEL: WARN
     volumes:
       - zookeeper_data:/var/lib/zookeeper/data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # ── Kafka (CDC event log) ───────────────────────────────────────────────────
+  # ── Kafka ─────────────────────────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: migratex-kafka
@@ -111,7 +166,8 @@ services:
     ports:
       - "9092:9092"
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -119,12 +175,21 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_LOG_RETENTION_HOURS: 168    # 7 days — matches binlog retention
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG4J_LOGGERS: "kafka=WARN,kafka.controller=WARN,kafka.log.LogCleaner=WARN,state.change.logger=WARN,kafka.producer.async.DefaultEventHandler=WARN"
     volumes:
       - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-  # ── Schema Registry ─────────────────────────────────────────────────────────
+  # ── Schema Registry ───────────────────────────────────────────────────────
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.0
     container_name: migratex-schema-registry
@@ -132,13 +197,20 @@ services:
     ports:
       - "8081:8081"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: WARN
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
-  # ── Kafka Connect + Debezium (CDC connector) ────────────────────────────────
+  # ── Kafka Connect + Debezium ──────────────────────────────────────────────
   kafka-connect:
     image: debezium/connect:2.6
     container_name: migratex-kafka-connect
@@ -146,20 +218,26 @@ services:
     ports:
       - "8083:8083"
     depends_on:
-      - kafka
-      - source
-      - schema-registry
+      kafka:
+        condition: service_healthy
+      source:
+        condition: service_healthy
     environment:
       BOOTSTRAP_SERVERS: kafka:29092
       GROUP_ID: migratex-connect-group
       CONFIG_STORAGE_TOPIC: migratex-connect-configs
       OFFSET_STORAGE_TOPIC: migratex-connect-offsets
       STATUS_STORAGE_TOPIC: migratex-connect-status
-      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       CONNECT_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      LOG_LEVEL: WARN
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
 
-  # ── etcd node 0 (AZ-1 simulation) ──────────────────────────────────────────
+  # ── etcd node 0 (AZ-1) ───────────────────────────────────────────────────
   etcd0:
     image: bitnami/etcd:3.5
     container_name: migratex-etcd0
@@ -176,9 +254,16 @@ services:
       ETCD_INITIAL_CLUSTER: etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       ETCD_INITIAL_CLUSTER_STATE: new
       ETCD_INITIAL_CLUSTER_TOKEN: migratex-cluster
+      ETCD_LOG_LEVEL: warn
     volumes:
       - etcd0_data:/bitnami/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ── etcd node 1 (AZ-2) ───────────────────────────────────────────────────
   etcd1:
     image: bitnami/etcd:3.5
     container_name: migratex-etcd1
@@ -195,9 +280,16 @@ services:
       ETCD_INITIAL_CLUSTER: etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       ETCD_INITIAL_CLUSTER_STATE: new
       ETCD_INITIAL_CLUSTER_TOKEN: migratex-cluster
+      ETCD_LOG_LEVEL: warn
     volumes:
       - etcd1_data:/bitnami/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ── etcd node 2 (AZ-3) ───────────────────────────────────────────────────
   etcd2:
     image: bitnami/etcd:3.5
     container_name: migratex-etcd2
@@ -214,10 +306,16 @@ services:
       ETCD_INITIAL_CLUSTER: etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       ETCD_INITIAL_CLUSTER_STATE: new
       ETCD_INITIAL_CLUSTER_TOKEN: migratex-cluster
+      ETCD_LOG_LEVEL: warn
     volumes:
       - etcd2_data:/bitnami/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # ── Prometheus ──────────────────────────────────────────────────────────────
+  # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.51.0
     container_name: migratex-prometheus
@@ -230,8 +328,14 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=30d"
+      - "--log.level=warn"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "-O", "-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
-  # ── Grafana ─────────────────────────────────────────────────────────────────
+  # ── Grafana ───────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.0
     container_name: migratex-grafana
@@ -239,16 +343,24 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_healthy
     environment:
+      GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: migratex
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_LOG_LEVEL: warn
     volumes:
       - grafana_data:/var/lib/grafana
       - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
-  # ── MigrateX Phase 1 ────────────────────────────────────────────────────────
+  # ── Phase 1: Discovery ────────────────────────────────────────────────────
   phase1:
     build:
       context: ./phase1-discovery
@@ -258,24 +370,175 @@ services:
     depends_on:
       source:
         condition: service_healthy
-      target:
-        condition: service_healthy
     environment:
-      SOURCE_HOST: source
-      SOURCE_PORT: 3306
-      SOURCE_USER: migratex_reader
-      SOURCE_PASSWORD: migratex_reader_pass
-      SOURCE_DATABASE: airbnb_prod
-      TARGET_HOST: target
-      TARGET_PORT: 3306
-      TARGET_USER: migratex_writer
-      TARGET_PASSWORD: migratex_writer_pass
-      TARGET_DATABASE: airbnb_prod
-      PONR_SIMULATIONS: 10000
-      PONR_SLA_THRESHOLD_USD: 5000.0
-      ANOMALY_ALERT_THRESHOLD: 0.7
+      <<: [*source-env, *target-env, *ponr-env]
       OUTPUT_DIR: /app/artifacts
       LOG_LEVEL: INFO
     volumes:
-      - ./artifacts/phase1:/app/artifacts
+      - phase1_artifacts:/app/artifacts
     command: python main.py run --ponr-data-gb 100 --ponr-write-mbps 50 --ponr-network-gbps 1.0
+    profiles: [phase1, all]
+
+  # ── Phase 2: Infrastructure ───────────────────────────────────────────────
+  phase2:
+    build:
+      context: ./phase2-infrastructure
+      dockerfile: Dockerfile
+    container_name: migratex-phase2
+    networks: [migratex]
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-connect:
+        condition: service_healthy
+      etcd0:
+        condition: service_healthy
+      etcd1:
+        condition: service_healthy
+      etcd2:
+        condition: service_healthy
+    environment:
+      <<: [*source-env, *target-env, *kafka-env, *etcd-env, *ponr-env]
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_PARTITIONS: "12"
+      KAFKA_REPLICATION_FACTOR: "1"
+      PROMETHEUS_PORT: "8000"
+      LOG_LEVEL: INFO
+    volumes:
+      - phase1_artifacts:/app/phase1_artifacts:ro
+      - phase2_artifacts:/app/artifacts
+    ports:
+      - "8002:8000"
+    command: python main.py provision --skip-binlog
+    profiles: [phase2, all]
+
+  # ── Phase 3: Chaos ────────────────────────────────────────────────────────
+  phase3:
+    build:
+      context: ./phase3-chaos
+      dockerfile: Dockerfile
+    container_name: migratex-phase3
+    networks: [migratex]
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: [*source-env, *target-env, *kafka-env, *etcd-env, *ponr-env]
+      CHAOS_BLAST_RADIUS: shadow
+      CHAOS_MAX_FAULT_DURATION_SECONDS: "600"
+      REPLAY_MULTIPLIER: "5.0"
+      RESILIENCE_PASS_THRESHOLD: "95"
+      PROMETHEUS_PORT: "8000"
+      LOG_LEVEL: INFO
+    volumes:
+      - phase2_artifacts:/app/phase2_artifacts:ro
+      - phase3_artifacts:/app/artifacts
+    ports:
+      - "8003:8000"
+    command: python main.py run --skip-replay
+    profiles: [phase3, all]
+
+  # ── Phase 4: Dark Launch ──────────────────────────────────────────────────
+  phase4:
+    build:
+      context: ./phase4-dark-launch
+      dockerfile: Dockerfile
+    container_name: migratex-phase4
+    networks: [migratex]
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    environment:
+      <<: [*source-env, *target-env, *ponr-env]
+      AUDIT_OBSERVATION_WINDOW_HOURS: "72"
+      SHADOW_WRITE_TIMEOUT_MS: "500"
+      EGRESS_BASELINE_PRICE_PER_GB: "0.09"
+      WAL_BUFFER_MAX_AGE_HOURS: "2"
+      PII_SURFACE_MAP_PATH: /app/phase1_artifacts/pii_surface_map.json
+      FK_GRAPH_PATH: /app/phase1_artifacts/fk_dependency_graph.json
+      LOG_LEVEL: INFO
+    volumes:
+      - phase1_artifacts:/app/phase1_artifacts:ro
+      - phase4_artifacts:/app/artifacts
+    ports:
+      - "8004:8000"
+    command: python main.py run
+    profiles: [phase4, all]
+
+  # ── Phase 5: Cutover ──────────────────────────────────────────────────────
+  phase5:
+    build:
+      context: ./phase5-cutover
+      dockerfile: Dockerfile
+    container_name: migratex-phase5
+    networks: [migratex]
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+      etcd0:
+        condition: service_healthy
+      etcd1:
+        condition: service_healthy
+      etcd2:
+        condition: service_healthy
+    environment:
+      <<: [*source-env, *target-env, *etcd-env, *ponr-env]
+      PREFLIGHT_REPLICATION_LAG_MAX: "5.0"
+      PREFLIGHT_ANOMALY_SCORE_MAX: "0.7"
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRY_MINUTES: "25"
+      FINAL_CALL_WINDOW_MINUTES: "25"
+      LOG_LEVEL: INFO
+    volumes:
+      - phase4_artifacts:/app/phase4_artifacts:ro
+      - phase5_artifacts:/app/artifacts
+    ports:
+      - "8005:8000"
+    command: python main.py preflight
+    profiles: [phase5, all]
+
+  # ── Phase 6: Hardening ────────────────────────────────────────────────────
+  phase6:
+    build:
+      context: ./phase6-hardening
+      dockerfile: Dockerfile
+    container_name: migratex-phase6
+    networks: [migratex]
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    environment:
+      <<: [*source-env, *target-env]
+      DECOMMISSION_WINDOW_DAYS: "10"
+      DECOMMISSION_DELETION_LOCK: "true"
+      RETRAINING_BASELINE_DAYS: "14"
+      MODEL_OUTPUT_DIR: /app/artifacts/model
+      REPORT_OUTPUT_DIR: /app/artifacts/reports
+      RUNBOOK_OUTPUT_DIR: /app/artifacts/runbooks
+      PHASE1_PONR_ESTIMATE_PATH: /app/phase1_artifacts/ponr_phase1_estimate.json
+      PHASE3_RESILIENCE_REPORT_PATH: /app/phase3_artifacts/resilience_report.json
+      LOG_LEVEL: INFO
+    volumes:
+      - phase1_artifacts:/app/phase1_artifacts:ro
+      - phase3_artifacts:/app/phase3_artifacts:ro
+      - phase5_artifacts:/app/phase5_artifacts:ro
+      - phase6_artifacts:/app/artifacts
+    ports:
+      - "8006:8000"
+    command: python main.py run
+    profiles: [phase6, all]
